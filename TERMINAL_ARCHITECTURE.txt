@@ -1,0 +1,144 @@
+================================================================================
+           TWITTER BOT ARCHITECTURE - SIMPLIFIED POLLING-ONLY SYSTEM
+================================================================================
+
+┌─────────────┐     Every 5 mins      ┌──────────────────┐
+│   Gmail     │ ◄──────────────────── │  EventBridge     │
+│    Inbox    │       (Pull)           │   Schedule       │
+└──────┬──────┘                        └──────────────────┘
+       │                                         │
+       │ Fetch new emails                        │ Trigger
+       ▼                                         ▼
+┌──────────────────────────────────────────────────────────┐
+│                  Lambda: Gmail Poller                     │
+│  • Check last timestamp from DynamoDB                     │
+│  • Fetch new emails from Gmail API                        │
+│  • Queue to SQS if not already processed                  │
+│  • Update last check time                                 │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+                       │ Send message
+                       ▼
+    ╔═══════════════════════════════════════╗
+    ║      SQS: Email Queue                  ║
+    ║  • 14 day retention                    ║
+    ║  • 5 min visibility timeout            ║
+    ╚═══════════════════╤═══════════════════╝
+                       │
+                       │ Trigger (batch 10)
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│            Lambda: Content Processor                      │
+│  • Check if already processed (DynamoDB)                  │
+│  • Call Bedrock Claude 3.5 for translation                │
+│  • Generate 280-char Japanese tweet (NO EMOJIS)           │
+│  • Queue to Twitter Queue                                 │
+│  • Mark as processed in DynamoDB                          │
+└──────────────────────┬───────────────────────────────────┘
+                       │                        ┌─────────────┐
+                       │ ──────────────────────►│  Bedrock    │
+                       │                        │  Claude AI  │
+                       │                        └─────────────┘
+                       │ Send tweet
+                       ▼
+    ╔═══════════════════════════════════════╗
+    ║      SQS: Twitter Queue                ║
+    ║  • 14 day retention                    ║
+    ║  • 5 min visibility timeout            ║
+    ╚═══════════════════╤═══════════════════╝
+                       │
+                       │ Trigger (batch 1)
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│             Lambda: Twitter Poster                        │
+│  • Authenticate with Twitter API                          │
+│  • Post tweet                                             │
+│  • Update DynamoDB with tweet ID                          │
+│  • Handle rate limits gracefully                          │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+                       │ Post
+                       ▼
+                ┌─────────────┐
+                │  Twitter/X  │
+                │     API     │
+                └─────────────┘
+
+================================================================================
+                            DATA STORES
+================================================================================
+
+┌─────────────────────────────────────────────────────────────┐
+│               DynamoDB: processed-emails                     │
+├───────────────────────────────────────────────────────────────┤
+│  Partition Key: email_id (String)                            │
+│  ┌──────────┬─────────┬────────────┬──────────┬───────────┐ │
+│  │ email_id │ status  │ tweet_text │ tweet_id │ posted_at │ │
+│  ├──────────┼─────────┼────────────┼──────────┼───────────┤ │
+│  │ 1988e... │ posted  │ GPT-5発表..│ 195411...│ 09:27:04  │ │
+│  │ test_... │ posted  │ AI技術の...│ 195410...│ 09:05:21  │ │
+│  │ 1988e0..│ queued  │    null    │   null   │   null    │ │
+│  └──────────┴─────────┴────────────┴──────────┴───────────┘ │
+└───────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│               DynamoDB: app-state                            │
+├───────────────────────────────────────────────────────────────┤
+│  Partition Key: key (String)                                 │
+│  ┌────────────────────┬────────────────────────────────────┐ │
+│  │        key         │            value                   │ │
+│  ├────────────────────┼────────────────────────────────────┤ │
+│  │ last_check_time    │ 2025-01-09T13:55:00Z               │ │
+│  └────────────────────┴────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────┘
+
+================================================================================
+                         STATUS FLOW
+================================================================================
+
+    [New Email] ──► [queued] ──► [queued_for_posting] ──► [posted] ──► ✓
+                        │                │                   │
+                        │                │                   └─► Twitter
+                        │                └─► AI Translation
+                        └─► In SQS Email Queue
+
+================================================================================
+                    LAMBDA SPECIFICATIONS
+================================================================================
+
+┌──────────────────────┬────────┬─────────┬─────────────────────┐
+│    Function Name     │ Memory │ Timeout │      Trigger        │
+├──────────────────────┼────────┼─────────┼─────────────────────┤
+│ gmail-poller         │ 256 MB │   60s   │ EventBridge (5 min) │
+│ content-processor    │ 512 MB │  120s   │ SQS Email Queue     │
+│ twitter-poster       │ 256 MB │   60s   │ SQS Twitter Queue   │
+└──────────────────────┴────────┴─────────┴─────────────────────┘
+
+Total: 3 Lambda Functions (Simplified from 4)
+
+================================================================================
+                        QUEUE METRICS
+================================================================================
+
+     Email Queue                        Twitter Queue
+    ┌───────────┐                      ┌───────────┐
+    │     0     │ Messages Available   │     0     │
+    │           │                      │           │
+    │  EMPTY    │                      │  EMPTY    │
+    └───────────┘                      └───────────┘
+    
+    Visibility: 300s                   Visibility: 300s
+    Retention: 14 days                 Retention: 14 days
+
+================================================================================
+                     SIMPLIFIED ARCHITECTURE BENEFITS
+================================================================================
+
+✅ NO API Gateway - No public endpoints to secure
+✅ NO Webhooks - No tokens to refresh  
+✅ Single Path - One clear flow from Gmail to Twitter
+✅ 3 Lambdas Only - Minimal components
+✅ Pull Model - System controls timing
+✅ No External Access - Everything runs inside AWS
+
+================================================================================
